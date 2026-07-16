@@ -101,6 +101,10 @@ app.use("/api/deleted", require("../routes/deleted"));
 // ==========================
 // LEDGERS
 // ==========================
+
+app.use("/registered-ledger", require("../routes/registeredLedger"));
+app.use("/api/registered-ledger", require("../routes/registeredLedger"));
+
 app.use("/customer-ledger", require("../routes/customerLedger"));
 app.use("/api/customer-ledger", require("../routes/customerLedger"));
 
@@ -140,6 +144,9 @@ app.use("/api/purchase", require("../routes/purchase"));
 // ==========================
 // SUPPLIER
 // ==========================
+app.use("/customers", require("../routes/customers"));
+app.use("/api/customers", require("../routes/customers"));
+
 app.use("/supplier", require("../routes/supplier"));
 app.use("/api/supplier", require("../routes/supplier"));
 
