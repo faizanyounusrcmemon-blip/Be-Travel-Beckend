@@ -1,4 +1,4 @@
-# Makki Madni Travel - Backend
+# Be Travel - Backend
 
 Node.js + Express API for travel packages and bookings.
 
