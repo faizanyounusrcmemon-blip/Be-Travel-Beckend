@@ -132,7 +132,7 @@ router.get("/detail/:customer_code", async (req, res) => {
    1. REGISTERED LEDGER DETAIL (FIXED RUNNING BALANCE)
 ===================================================== */
 
-// 1. Pehle Oldest to Newest (Ascending) sort karein taake Balance sahi calculate ho
+// 1. Pehle Oldest to Newest (Ascending) sort karein
 allEntries.sort((a, b) => new Date(a.date) - new Date(b.date));
 
 let runningBalance = 0;
@@ -154,8 +154,8 @@ allEntries.forEach((entry) => {
   }
 });
 
-// 3. UI par dikhane ke liye Newest First (Descending) sort kar lein
-calculatedRows.sort((a, b) => new Date(b.date) - new Date(a.date));
+// 3. UI par dikhane ke liye array ko REVERSE kar dein (Newest First)
+calculatedRows.reverse();
 
 res.json({
   success: true,
