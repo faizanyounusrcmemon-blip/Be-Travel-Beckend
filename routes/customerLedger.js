@@ -267,42 +267,49 @@ router.get("/:ref_no", async (req, res) => {
       balance: 0
     });
 
-/* SALE / OPENING BALANCE */
-let saleDescription = `Sale Invoice (${ref_no})`; // Ref No ke sath
+    /* SALE / OPENING BALANCE */
+    let saleDescription = `Sale Invoice (${ref_no})`;
 
-// Check if it's coming from Archive Balances table
-try {
-  const archCheck = await db.query(
-    `SELECT balance FROM archive_balances 
-     WHERE TRIM(LOWER(code)) = LOWER($1) 
-     AND balance_type = 'CUSTOMER' LIMIT 1`,
-    [ref_no]
-  );
-  if (archCheck.rows.length > 0) {
-    saleDescription = `Opening Balance (${ref_no})`;
-  }
-} catch (e) {}
+    try {
+      const archCheck = await db.query(
+        `SELECT balance FROM archive_balances 
+         WHERE TRIM(LOWER(code)) = LOWER($1) 
+         AND balance_type = 'CUSTOMER' LIMIT 1`,
+        [ref_no]
+      );
+      if (archCheck.rows.length > 0) {
+        saleDescription = `Opening Balance (${ref_no})`;
+      }
+    } catch (e) {}
 
-const totalSale = Math.round(await getSaleAmount(ref_no));
+    const totalSale = Math.round(await getSaleAmount(ref_no));
 
-if (totalSale > 0) {
-  balance += totalSale;
-  rows.push({
-    id: "SALE",
-    date: baseDate,
-    description: saleDescription, // Ab Ref No bhi sath aayega
-    debit: 0,
-    credit: totalSale,
-    balance
-  });
-}
+    if (totalSale > 0) {
+      balance += totalSale;
+      rows.push({
+        id: "SALE",
+        date: baseDate,
+        description: saleDescription,
+        debit: 0,
+        credit: totalSale,
+        balance
+      });
+    }
 
-    /* PAYMENTS */
+    /* PAYMENTS WITH BANK NAME JOIN */
     const payments = await db.query(
-      `SELECT id, payment_date, amount, type, payment_method FROM customer_payments 
-       WHERE TRIM(LOWER(ref_no)) = LOWER($1) 
-       AND (is_deleted IS NOT TRUE OR is_deleted IS NULL) 
-       ORDER BY payment_date, id`,
+      `SELECT 
+         cp.id, 
+         cp.payment_date, 
+         cp.amount, 
+         cp.type, 
+         cp.payment_method, 
+         b.bank_name
+       FROM customer_payments cp
+       LEFT JOIN public.banks b ON b.id = cp.bank_profile_id
+       WHERE TRIM(LOWER(cp.ref_no)) = LOWER($1) 
+       AND (cp.is_deleted IS NOT TRUE OR cp.is_deleted IS NULL) 
+       ORDER BY cp.payment_date, cp.id`,
       [ref_no]
     );
 
@@ -310,10 +317,17 @@ if (totalSale > 0) {
       const amount = Math.round(Number(p.amount || 0));
       balance -= amount;
 
+      let methodDesc = p.payment_method || "";
+      if (p.payment_method?.toLowerCase() === "bank" && p.bank_name) {
+        methodDesc = `Bank: ${p.bank_name}`;
+      } else if (p.payment_method?.toLowerCase() === "bank") {
+        methodDesc = "Bank";
+      }
+
       rows.push({
         id: p.id,
         date: p.payment_date,
-        description: p.type === "adjustment" ? "Adjustment" : `Payment Received (${p.payment_method || ""})`,
+        description: p.type === "adjustment" ? "Adjustment" : `Payment Received (${methodDesc})`,
         debit: amount,
         credit: 0,
         balance
@@ -323,6 +337,9 @@ if (totalSale > 0) {
     res.json({
       success: true,
       customer: customerName,
+      customerName,
+      totalSale,
+      currentBalance: balance,
       rows
     });
 
@@ -341,19 +358,28 @@ if (totalSale > 0) {
 router.post("/payment", async (req, res) => {
   const client = await db.connect();
   try {
-    const { ref_no, amount, payment_method, type, payment_date } = req.body;
+    const { ref_no, amount, payment_method, bank_profile_id, type, payment_date } = req.body;
 
     if (!ref_no) return res.json({ success: false, error: "Ref No required" });
     if (!amount || Number(amount) <= 0) return res.json({ success: false, error: "Invalid amount" });
     if (!payment_date) return res.json({ success: false, error: "Date required" });
 
+    const isBank = (payment_method || "").toLowerCase() === "bank";
+
     await client.query("BEGIN");
     await client.query(
       `
-      INSERT INTO customer_payments (ref_no, amount, payment_method, type, payment_date)
-      VALUES ($1, $2, $3, $4, $5)
+      INSERT INTO customer_payments (ref_no, amount, payment_method, bank_profile_id, type, payment_date)
+      VALUES ($1, $2, $3, $4, $5, $6)
       `,
-      [ref_no, amount, payment_method || "cash", type || "payment", payment_date]
+      [
+        ref_no, 
+        amount, 
+        payment_method || "cash", 
+        isBank ? (bank_profile_id || null) : null, 
+        type || "payment", 
+        payment_date
+      ]
     );
 
     await client.query("COMMIT");
@@ -425,7 +451,7 @@ router.delete("/delete/:id", async (req, res) => {
 router.put("/edit/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { password, amount, payment_date, payment_method, type } = req.body;
+    const { password, amount, payment_date, payment_method, bank_profile_id, type } = req.body;
 
     if (!id || isNaN(id)) {
       return res.json({ success: false, error: "Invalid payment ID" });
@@ -467,14 +493,22 @@ router.put("/edit/:id", async (req, res) => {
       }
 
       const ref_no = payRes.rows[0].ref_no;
+      const isBank = (payment_method || "").toLowerCase() === "bank";
 
       await client.query(
         `
         UPDATE customer_payments
-        SET amount = $1, payment_date = $2, payment_method = $3, type = $4
-        WHERE id = $5
+        SET amount = $1, payment_date = $2, payment_method = $3, bank_profile_id = $4, type = $5
+        WHERE id = $6
         `,
-        [amount, payment_date, payment_method || "Bank", type || "payment", id]
+        [
+          amount, 
+          payment_date, 
+          payment_method || "Bank", 
+          isBank ? (bank_profile_id || null) : null, 
+          type || "payment", 
+          id
+        ]
       );
 
       await client.query("COMMIT");

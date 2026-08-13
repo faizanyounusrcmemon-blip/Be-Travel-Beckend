@@ -3,108 +3,54 @@ const router = express.Router();
 const pool = require("../db");
 
 /* ======================================================
-   GET CASH LEDGER
-   PERFECT SNAPSHOT INTEGRATION & TIMEZONE FIX
+   GET CASH LEDGER (WITH ARCHIVE SNAPSHOT BASELINE)
 ====================================================== */
 router.get("/", async (req, res) => {
   try {
+    // 1. Fetch Latest Archive Snapshot Baseline
     const snapshotRes = await pool.query(`
-      SELECT date_to, opening_cash 
+      SELECT date_to, COALESCE(opening_cash, 0) AS opening_cash 
       FROM archive_snapshots 
       WHERE opening_cash IS NOT NULL 
       ORDER BY date_to DESC, id DESC 
       LIMIT 1
     `);
 
-    let snapshotDateTo = '1970-01-01'; 
+    let snapshotDateTo = "1970-01-01";
+    let openingCashBaseline = 0;
     let hasSnapshot = false;
 
     if (snapshotRes.rows.length > 0) {
       const rawDate = snapshotRes.rows[0].date_to;
-      snapshotDateTo = new Date(rawDate).toLocaleDateString('en-CA');
+      snapshotDateTo = new Date(rawDate).toISOString().split("T")[0];
+      openingCashBaseline = Number(snapshotRes.rows[0].opening_cash || 0);
       hasSnapshot = true;
     }
 
+    // 2. Query Live Transactions strictly created AFTER snapshot cutoff date
     const sql = `
-    WITH opening AS (
-        SELECT
-          0 AS id,
-          $1::date AS txn_date,
-          'Opening Cash Balance' AS description,
-
-          CASE 
-            WHEN opening_cash > 0 THEN ROUND(opening_cash::numeric,0)
-          END AS credit,
-
-          CASE
-            WHEN opening_cash < 0 THEN ROUND(ABS(opening_cash)::numeric,0)
-          END AS debit,
-
-          0 AS order_priority,
-          'opening' AS source
-        FROM archive_snapshots
-        WHERE opening_cash IS NOT NULL
-        ORDER BY date_to DESC, id DESC
-        LIMIT 1
-    ),
-
-    all_entries AS (
-
-        /* ================= OPENING ================= */
-        SELECT id, txn_date, description, credit, debit, order_priority, source FROM opening
-
-        UNION ALL
-
-        /* ================= CUSTOMER CASH (DYNAMIC LOOKUP FOR REG & WALK-IN) ================= */
+    WITH all_entries AS (
+        /* CUSTOMER CASH */
         SELECT
           cp.id,
           cp.payment_date::date AS txn_date,
           'Customer Payment - ' || COALESCE(
-             CASE 
-               WHEN cp.ref_no LIKE 'CUST-%' THEN
-                 COALESCE(
-                   (SELECT name FROM customers WHERE customer_code = cp.ref_no LIMIT 1),
-                   (SELECT customer_name FROM (
-                      SELECT customer_name FROM bookings WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                      UNION ALL
-                      SELECT customer_name FROM hotels WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                      UNION ALL
-                      SELECT customer_name FROM visa WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                      UNION ALL
-                      SELECT customer_name FROM card WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                      UNION ALL
-                      SELECT customer_name FROM groups WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                      UNION ALL
-                      SELECT customer_name FROM ticketing WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                      UNION ALL
-                      SELECT customer_name FROM transport WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                      UNION ALL
-                      SELECT customer_name FROM ziyarat WHERE customer_code = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    ) reg_cust LIMIT 1)
-                 )
-               ELSE
-                 (SELECT customer_name FROM (
-                    SELECT customer_name FROM bookings WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    UNION ALL
-                    SELECT customer_name FROM hotels WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    UNION ALL
-                    SELECT customer_name FROM visa WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    UNION ALL
-                    SELECT customer_name FROM card WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    UNION ALL
-                    SELECT customer_name FROM groups WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    UNION ALL
-                    SELECT customer_name FROM ticketing WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    UNION ALL
-                    SELECT customer_name FROM transport WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                    UNION ALL
-                    SELECT customer_name FROM ziyarat WHERE ref_no = cp.ref_no AND customer_name IS NOT NULL AND customer_name != ''
-                  ) walkin_cust LIMIT 1)
-             END, 'Walk-in Customer'
+             (SELECT customer_name FROM (
+                SELECT name AS customer_name FROM customers WHERE customer_code = cp.ref_no AND name IS NOT NULL AND name != ''
+                UNION ALL SELECT name AS customer_name FROM archive_balances WHERE code = cp.ref_no AND name IS NOT NULL AND name != ''
+                UNION ALL SELECT customer_name FROM bookings WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+                UNION ALL SELECT customer_name FROM hotels WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+                UNION ALL SELECT customer_name FROM visa WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+                UNION ALL SELECT customer_name FROM card WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+                UNION ALL SELECT customer_name FROM groups WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+                UNION ALL SELECT customer_name FROM ticketing WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+                UNION ALL SELECT customer_name FROM transport WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+                UNION ALL SELECT customer_name FROM ziyarat WHERE (customer_code = cp.ref_no OR ref_no = cp.ref_no) AND customer_name IS NOT NULL AND customer_name != ''
+              ) reg_cust LIMIT 1), 'Walk-in Customer'
           ) || ' (Ref: ' || cp.ref_no || ')' AS description,
           ROUND(cp.amount::numeric,0) AS credit,
           NULL::numeric AS debit,
-          1 AS order_priority,
+          2 AS order_priority,
           'customer' AS source
         FROM customer_payments cp
         WHERE LOWER(COALESCE(cp.type,'')) != 'adjustment'
@@ -115,14 +61,14 @@ router.get("/", async (req, res) => {
 
         UNION ALL
 
-        /* ================= SUPPLIER CASH (DOBARA ADD KIYA GAYA) ================= */
+        /* SUPPLIER CASH */
         SELECT
           sp.id,
           sp.payment_date::date AS txn_date,
           'Supplier Payment - ' || COALESCE(s.supplier_name,'') || ' (Ref: ' || sp.id || ')' AS description,
           NULL::numeric AS credit,
           ROUND(sp.amount::numeric,0) AS debit,
-          1 AS order_priority,
+          2 AS order_priority,
           'supplier' AS source
         FROM supplier_payments sp
         LEFT JOIN suppliers s ON s.id = sp.supplier_id
@@ -133,14 +79,14 @@ router.get("/", async (req, res) => {
 
         UNION ALL
 
-        /* ================= EXPENSE CASH ================= */
+        /* EXPENSE CASH */
         SELECT
           e.id,
           e.expense_date::date AS txn_date,
           'Expense: ' || e.title AS description,
           NULL::numeric AS credit,
           ROUND(e.amount::numeric,0) AS debit,
-          1 AS order_priority,
+          2 AS order_priority,
           'expense' AS source
         FROM expense_ledger e
         WHERE LOWER(COALESCE(e.payment_method,''))='cash'
@@ -148,46 +94,54 @@ router.get("/", async (req, res) => {
 
         UNION ALL
 
-        /* ================= MANUAL CASH ================= */
+        /* MANUAL CASH */
         SELECT
           bt.id,
           bt.txn_date::date AS txn_date,
           bt.comment AS description,
           CASE WHEN bt.type='deposit' THEN ROUND(bt.amount::numeric,0) END AS credit,
           CASE WHEN bt.type='withdraw' THEN ROUND(bt.amount::numeric,0) END AS debit,
-          1 AS order_priority,
+          2 AS order_priority,
           'manual' AS source
         FROM cash_transactions bt
         WHERE bt.txn_date::date > $1::date 
     )
-
-    SELECT
-      id,
-      txn_date,
-      description,
-      credit,
-      debit,
-      source,
-      ROUND(
-        SUM(COALESCE(credit,0) - COALESCE(debit,0)) OVER(ORDER BY txn_date ASC, order_priority ASC, id ASC)
-      ,0) AS balance
+    SELECT id, txn_date, description, credit, debit, source, order_priority
     FROM all_entries
     ORDER BY txn_date ASC, order_priority ASC, id ASC;
     `;
 
     const result = await pool.query(sql, [snapshotDateTo]);
+    let formattedRows = [];
+    let runningBalance = 0;
 
-    let rows = result.rows;
-    if (!hasSnapshot) {
-      rows = rows.filter(r => r.source !== 'opening');
+    // 3. Inject Baseline Opening Cash Row if Snapshot Exists
+    if (hasSnapshot) {
+      runningBalance = openingCashBaseline;
+      formattedRows.push({
+        id: "SNAPSHOT_OPENING",
+        txn_date: snapshotDateTo,
+        description: `🔑 Archived Snapshot Cash Baseline (${snapshotDateTo})`,
+        credit: openingCashBaseline >= 0 ? openingCashBaseline : 0,
+        debit: openingCashBaseline < 0 ? Math.abs(openingCashBaseline) : 0,
+        source: "snapshot",
+        balance: runningBalance
+      });
     }
 
-    const formattedRows = rows.map(r => ({
-      ...r,
-      credit: Number(r.credit || 0),
-      debit: Number(r.debit || 0),
-      balance: Number(r.balance || 0)
-    }));
+    // 4. Calculate Running Balance over live records
+    result.rows.forEach(r => {
+      const credit = Number(r.credit || 0);
+      const debit = Number(r.debit || 0);
+      runningBalance += (credit - debit);
+
+      formattedRows.push({
+        ...r,
+        credit,
+        debit,
+        balance: runningBalance
+      });
+    });
 
     res.json({
       success: true,
@@ -196,14 +150,9 @@ router.get("/", async (req, res) => {
 
   } catch (err) {
     console.error("CASH LEDGER ERROR:", err);
-    res.json({
-      success: false,
-      error: err.message
-    });
+    res.json({ success: false, error: err.message });
   }
 });
-
-// Baaki routes (POST, DELETE, PUT) bilkul same rahenge...
 
 
 /* ======================================================
@@ -244,7 +193,6 @@ router.delete("/transaction/:id", async (req, res) => {
   try {
     const { password } = req.body;
 
-    // 🔑 Database se dynamic look up (Bina kisi hardcoded fallback ke)
     const passCheck = await pool.query(
       "SELECT password_val FROM system_passwords WHERE key_name = $1", 
       ['delete_cash_transaction']
@@ -300,7 +248,6 @@ router.put("/transaction/:id", async (req, res) => {
       return res.json({ success: false, error: "Amount must be greater than zero" });
     }
 
-    // 🔑 Authorization Password Check
     const passCheck = await pool.query(
       "SELECT password_val FROM system_passwords WHERE key_name = $1",
       ["delete_cash_transaction"]
@@ -314,7 +261,6 @@ router.put("/transaction/:id", async (req, res) => {
       return res.json({ success: false, error: "Wrong Password!" });
     }
 
-    // Update Record
     await pool.query(
       `
       UPDATE cash_transactions
