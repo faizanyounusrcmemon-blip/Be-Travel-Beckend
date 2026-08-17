@@ -3,7 +3,7 @@ const router = express.Router();
 const db = require("../db");
 
 /* =========================================
-   BALANCE SHEET (FIXED: CUSTOMER NAME FALLBACK)
+   BALANCE SHEET (WITH CASH & BANKS)
 ========================================= */
 router.get("/", async (req, res) => {
   try {
@@ -19,7 +19,7 @@ router.get("/", async (req, res) => {
       snapshotDate = snapshot.rows[0].date_to;
     }
 
-    /* ========== 1. ALL REGISTERED CUSTOMER CODES ========== */
+    /* ========== 1. REGISTERED CUSTOMER CODES ========== */
     const regCustomerCodesRes = await db.query(`
       SELECT DISTINCT customer_code FROM bookings WHERE customer_code IS NOT NULL AND customer_code != '' AND is_deleted=false
       UNION SELECT customer_code FROM hotels WHERE customer_code IS NOT NULL AND customer_code != '' AND is_deleted=false
@@ -46,24 +46,17 @@ router.get("/", async (req, res) => {
     `, [snapshotId]);
     const supplierSnapshot = supplierSnapshotRes.rows;
 
-    /* ========== 3. STANDARD MODULE CUSTOMERS (WALK-IN) ========== */
+    /* ========== 3. STANDARD MODULE CUSTOMERS ========== */
     const customersData = await db.query(`
       SELECT * FROM (
         SELECT ref_no, customer_name, payment_status, total_pkr FROM bookings WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
-        UNION ALL
-        SELECT ref_no, customer_name, payment_status, total_pkr FROM hotels WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
-        UNION ALL
-        SELECT ref_no, customer_name, payment_status, total_pkr FROM visa WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
-        UNION ALL
-        SELECT ref_no, customer_name, payment_status, total_pkr FROM card WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
-        UNION ALL
-        SELECT ref_no, customer_name, payment_status, total_pkr FROM groups WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
-        UNION ALL
-        SELECT ref_no, customer_name, payment_status, total_pkr FROM ticketing WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
-        UNION ALL
-        SELECT ref_no, customer_name, payment_status, total_pkr FROM transport WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
-        UNION ALL
-        SELECT ref_no, customer_name, payment_status, total_pkr FROM ziyarat WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
+        UNION ALL SELECT ref_no, customer_name, payment_status, total_pkr FROM hotels WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
+        UNION ALL SELECT ref_no, customer_name, payment_status, total_pkr FROM visa WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
+        UNION ALL SELECT ref_no, customer_name, payment_status, total_pkr FROM card WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
+        UNION ALL SELECT ref_no, customer_name, payment_status, total_pkr FROM groups WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
+        UNION ALL SELECT ref_no, customer_name, payment_status, total_pkr FROM ticketing WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
+        UNION ALL SELECT ref_no, customer_name, payment_status, total_pkr FROM transport WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
+        UNION ALL SELECT ref_no, customer_name, payment_status, total_pkr FROM ziyarat WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) AND (customer_code IS NULL OR customer_code = '')
       ) x
     `, [snapshotDate]);
 
@@ -74,7 +67,6 @@ router.get("/", async (req, res) => {
       GROUP BY ref_no
     `, [snapshotDate]);
 
-    // Unique standard ref_nos combining sales & snapshot
     const allStdRefNos = Array.from(new Set([
       ...customersData.rows.map(r => r.ref_no),
       ...customerSnapshot.filter(s => !s.code.startsWith("CUST-")).map(s => s.code)
@@ -89,7 +81,6 @@ router.get("/", async (req, res) => {
       const openingBalance = Number(snapItem?.balance || 0);
       const balance = openingBalance + saleTotal - received;
 
-      // Extract Name properly from sales module or archive snapshot
       const foundName = salesRows.find(r => r.customer_name && r.customer_name.trim() !== '')?.customer_name 
                       || snapItem?.name 
                       || "Walk-In Customer";
@@ -175,7 +166,7 @@ router.get("/", async (req, res) => {
       }).filter(r => r.balance !== 0 || r.sale_total !== 0);
     }
 
-    /* ========== 5. SUPPLIERS SECTIONS ========== */
+    /* ========== 5. SUPPLIERS SECTION ========== */
     const purchaseTotals = await db.query(`
       SELECT supplier_code, SUM(purchase_pkr) AS purchase_total FROM purchase_entries WHERE is_deleted = false AND ($1::date IS NULL OR created_at::date > $1) GROUP BY supplier_code
     `, [snapshotDate]);
@@ -218,17 +209,114 @@ router.get("/", async (req, res) => {
       };
     }).filter(s => s.balance !== 0 || s.purchase_total !== 0).sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance));
 
-    /* ========== 6. SUMMARY CALCULATION ========== */
+    /* ========== 6. CASH IN HAND CALCULATION ========== */
+    const cashSnapRes = await db.query(`SELECT opening_cash FROM archive_snapshots WHERE id=$1`, [snapshotId]);
+    let cashBalance = Number(cashSnapRes.rows[0]?.opening_cash || 0);
+
+    const cashTxns = await db.query(`
+      SELECT COALESCE(SUM(credit - debit), 0) AS net_cash
+      FROM (
+        /* Customer Cash Payments */
+        SELECT amount AS credit, 0 AS debit 
+        FROM customer_payments 
+        WHERE LOWER(COALESCE(payment_method, '')) = 'cash' 
+          AND LOWER(COALESCE(type, '')) NOT IN ('adjustment', 'opening_balance') 
+          AND is_deleted = false 
+          AND ($1::date IS NULL OR payment_date::date > $1)
+
+        UNION ALL
+
+        /* Supplier Cash Payments */
+        SELECT 0 AS credit, amount AS debit 
+        FROM supplier_payments 
+        WHERE LOWER(COALESCE(payment_method, '')) = 'cash' 
+          AND LOWER(COALESCE(type, '')) NOT IN ('adjustment', 'opening_balance') 
+          AND ($1::date IS NULL OR payment_date::date > $1)
+
+        UNION ALL
+
+        /* Expense Cash Payments */
+        SELECT 0 AS credit, amount AS debit 
+        FROM expense_ledger 
+        WHERE LOWER(COALESCE(payment_method, '')) = 'cash' 
+          AND ($1::date IS NULL OR expense_date::date > $1)
+
+        UNION ALL
+
+        /* Manual Cash Entries */
+        SELECT 
+          CASE WHEN LOWER(type) = 'deposit' THEN amount ELSE 0 END AS credit,
+          CASE WHEN LOWER(type) = 'withdraw' THEN amount ELSE 0 END AS debit
+        FROM cash_transactions
+        WHERE ($1::date IS NULL OR txn_date::date > $1)
+      ) x
+    `, [snapshotDate]);
+
+    cashBalance += Number(cashTxns.rows[0]?.net_cash || 0);
+
+    /* ========== 7. BANK PROFILES BALANCES ========== */
+    const bankProfilesRes = await db.query(`SELECT id, bank_name, account_title, account_number FROM banks WHERE LOWER(status) = 'active' ORDER BY id ASC`);
+
+    let banksList = [];
+    let totalBankBalance = 0;
+
+    for (let b of bankProfilesRes.rows) {
+      const bSnapRes = await db.query(`
+        SELECT balance FROM archive_balances WHERE snapshot_id = $1 AND UPPER(balance_type) = 'BANK' AND code = $2
+      `, [snapshotId, String(b.id)]);
+      let bBalance = Number(bSnapRes.rows[0]?.balance || 0);
+
+      const bTxns = await db.query(`
+        SELECT COALESCE(SUM(CASE WHEN method='in' THEN amount ELSE -amount END), 0) AS net_bank
+        FROM (
+          SELECT amount, 'in' AS method FROM customer_payments WHERE payment_method='bank' AND bank_profile_id=$1 AND is_deleted=false AND ($2::date IS NULL OR payment_date::date > $2) AND type != 'opening_balance'
+          UNION ALL
+          SELECT amount, 'out' AS method FROM supplier_payments WHERE payment_method='bank' AND bank_profile_id=$1 AND ($2::date IS NULL OR payment_date::date > $2) AND type != 'opening_balance'
+          UNION ALL
+          SELECT amount, 'out' AS method FROM expense_ledger WHERE payment_method='bank' AND bank_profile_id=$1 AND ($2::date IS NULL OR expense_date::date > $2)
+          UNION ALL
+          SELECT amount, CASE WHEN type='deposit' THEN 'in' ELSE 'out' END AS method FROM bank_transactions WHERE bank_profile_id=$1 AND ($2::date IS NULL OR txn_date::date > $2)
+        ) x
+      `, [b.id, snapshotDate]);
+
+      bBalance += Number(bTxns.rows[0]?.net_bank || 0);
+      totalBankBalance += bBalance;
+
+      banksList.push({
+        id: b.id,
+        bank_name: b.bank_name,
+        account_title: b.account_title,
+        account_number: b.account_number,
+        balance: bBalance
+      });
+    }
+
+    /* ========== 8. SUMMARY CALCULATION WITH FINAL POSITION ========== */
     const totalRegReceivable = registeredRows.filter(r => r.balance > 0).reduce((a, r) => a + r.balance, 0);
     const totalStdReceivable = standardCustomerRows.filter(r => r.balance > 0).reduce((a, r) => a + r.balance, 0);
-    const totalRegExtra = registeredRows.filter(r => r.balance < 0).reduce((a, r) => a + Math.abs(r.balance), 0);
+    const totalReceivable = totalStdReceivable + totalRegReceivable;
+
+    const totalPayable = suppliers.filter(r => r.balance > 0).reduce((a, r) => a + r.balance, 0);
+
     const totalStdExtra = standardCustomerRows.filter(r => r.balance < 0).reduce((a, r) => a + Math.abs(r.balance), 0);
+    const totalRegExtra = registeredRows.filter(r => r.balance < 0).reduce((a, r) => a + Math.abs(r.balance), 0);
+    const totalExtraReceived = totalStdExtra + totalRegExtra;
+
+    const totalExtraPaid = suppliers.filter(r => r.balance < 0).reduce((a, r) => a + Math.abs(r.balance), 0);
+
+    // Final Net Position Calculation
+    const totalAssets = totalReceivable + cashBalance + totalBankBalance + totalExtraPaid;
+    const totalLiabilities = totalPayable + totalExtraReceived;
+    const finalNetPosition = totalAssets - totalLiabilities;
 
     const summary = {
-      total_receivable: totalStdReceivable + totalRegReceivable,
-      total_payable: suppliers.filter(r => r.balance > 0).reduce((a, r) => a + r.balance, 0),
-      total_extra_received: totalStdExtra + totalRegExtra,
-      total_extra_paid: suppliers.filter(r => r.balance < 0).reduce((a, r) => a + Math.abs(r.balance), 0)
+      total_receivable: totalReceivable,
+      total_payable: totalPayable,
+      total_extra_received: totalExtraReceived,
+      total_extra_paid: totalExtraPaid,
+      cash_in_hand: cashBalance,
+      total_bank_balance: totalBankBalance,
+      final_net_position: finalNetPosition
     };
 
     return res.json({
@@ -237,6 +325,7 @@ router.get("/", async (req, res) => {
       customers: standardCustomerRows.sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance)),
       registeredCustomers: registeredRows.sort((a, b) => Math.abs(b.balance) - Math.abs(a.balance)),
       suppliers,
+      banks: banksList,
       summary
     });
 
