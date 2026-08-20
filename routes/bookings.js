@@ -15,6 +15,7 @@ async function generateRefNo() {
   const no = q.rows[0].no;
   return "PKG-" + String(no).padStart(5, "0");
 }
+
 // ============================================
 // SAVE BOOKING (NEW + EDIT)
 // ============================================
