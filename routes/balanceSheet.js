@@ -63,7 +63,7 @@ router.get("/", async (req, res) => {
     const payments = await db.query(`
       SELECT ref_no, COALESCE(SUM(amount),0) AS received
       FROM customer_payments
-      WHERE ($1::date IS NULL OR payment_date::date > $1) AND LOWER(COALESCE(type, '')) NOT IN ('adjustment', 'opening_balance') AND is_deleted = false
+      WHERE ($1::date IS NULL OR payment_date::date > $1) AND type != 'opening_balance' AND is_deleted = false
       GROUP BY ref_no
     `, [snapshotDate]);
 
@@ -111,10 +111,10 @@ router.get("/", async (req, res) => {
           UNION ALL SELECT customer_code, total_pkr FROM ticketing WHERE customer_code = ANY($1) AND is_deleted=false AND ($2::date IS NULL OR created_at::date > $2)
           UNION ALL SELECT customer_code, total_pkr FROM transport WHERE customer_code = ANY($1) AND is_deleted=false AND ($2::date IS NULL OR created_at::date > $2)
           UNION ALL SELECT customer_code, total_pkr FROM ziyarat WHERE customer_code = ANY($1) AND is_deleted=false AND ($2::date IS NULL OR created_at::date > $2)
-          UNION ALL SELECT ref_no AS customer_code, amount FROM customer_payments WHERE ref_no = ANY($1) AND LOWER(COALESCE(type, '')) = 'opening_balance' AND is_deleted=false AND ($2::date IS NULL OR payment_date::date > $2)
+          UNION ALL SELECT ref_no AS customer_code, amount FROM customer_payments WHERE ref_no = ANY($1) AND type='opening_balance' AND is_deleted=false AND ($2::date IS NULL OR payment_date::date > $2)
         ),
         all_credits AS (
-          SELECT ref_no AS customer_code, amount FROM customer_payments WHERE ref_no = ANY($1) AND LOWER(COALESCE(type, '')) NOT IN ('adjustment', 'opening_balance') AND is_deleted=false AND ($2::date IS NULL OR payment_date::date > $2)
+          SELECT ref_no AS customer_code, amount FROM customer_payments WHERE ref_no = ANY($1) AND type != 'opening_balance' AND is_deleted=false AND ($2::date IS NULL OR payment_date::date > $2)
         ),
         customer_names AS (
           SELECT DISTINCT ON (customer_code) customer_code, customer_name
@@ -174,8 +174,8 @@ router.get("/", async (req, res) => {
     const paymentTotals = await db.query(`
       SELECT 
         s.supplier_code, 
-        COALESCE(SUM(CASE WHEN LOWER(COALESCE(sp.type, '')) = 'opening_balance' THEN sp.amount ELSE 0 END), 0) AS live_opening_balance,
-        COALESCE(SUM(CASE WHEN LOWER(COALESCE(sp.type, '')) NOT IN ('opening_balance', 'adjustment') THEN sp.amount ELSE 0 END), 0) AS paid 
+        COALESCE(SUM(CASE WHEN sp.type = 'opening_balance' THEN sp.amount ELSE 0 END), 0) AS live_opening_balance,
+        COALESCE(SUM(CASE WHEN sp.type != 'opening_balance' THEN sp.amount ELSE 0 END), 0) AS paid 
       FROM suppliers s 
       LEFT JOIN supplier_payments sp ON sp.supplier_id = s.id AND ($1::date IS NULL OR sp.payment_date::date > $1) 
       WHERE s.is_deleted = false 
