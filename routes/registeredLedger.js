@@ -134,7 +134,8 @@ router.get("/detail/:customer_code", async (req, res) => {
       [customer_code, snapshotDateTo]
     );
 
-    // Load Live Payments after snapshot
+
+// Load Live Payments after snapshot
     const paymentsRes = await db.query(
       `
       SELECT cp.id, cp.payment_date, cp.amount, cp.type, cp.payment_method, cp.bank_profile_id, b.bank_name
@@ -160,87 +161,118 @@ router.get("/detail/:customer_code", async (req, res) => {
       });
     });
 
-// Payments -> Debit (-)
-paymentsRes.rows.forEach(p => {
-  const amt = Math.round(Number(p.amount || 0));
-  let methodDesc = p.payment_method || "";
-  if (p.payment_method?.toLowerCase() === "bank" && p.bank_name) {
-    methodDesc = `Bank: ${p.bank_name}`;
-  }
+    // Payments -> Debit (-)
+    paymentsRes.rows.forEach(p => {
+      const amt = Math.round(Number(p.amount || 0));
+      let methodDesc = p.payment_method || "";
+      if (p.payment_method?.toLowerCase() === "bank" && p.bank_name) {
+        methodDesc = `Bank: ${p.bank_name}`;
+      }
 
-  if (p.type === "opening_balance") {
-    allEntries.push({
-      id: p.id,
-      date: p.payment_date,
-      description: `🔑 Opening Balance`,
-      debit: 0,
-      credit: amt,
-      type: "opening_balance",
-      payment_method: p.payment_method || "-", // 👈 Add this line
-      bank_name: p.bank_name || null           // 👈 Add this line
+      if (p.type === "opening_balance") {
+        allEntries.push({
+          id: p.id,
+          date: p.payment_date,
+          description: `🔑 Opening Balance`,
+          debit: 0,
+          credit: amt,
+          type: "opening_balance",
+          payment_method: p.payment_method || "-",
+          bank_name: p.bank_name || null
+        });
+      } else {
+        allEntries.push({
+          id: p.id,
+          date: p.payment_date,
+          description: p.type === "adjustment" ? `Adjustment (${methodDesc})` : `Payment Received (${methodDesc})`,
+          debit: amt,
+          credit: 0,
+          type: "payment",
+          payment_method: p.payment_method || "-",
+          bank_name: p.bank_name || null
+        });
+      }
     });
-  } else {
-    allEntries.push({
-      id: p.id,
-      date: p.payment_date,
-      description: p.type === "adjustment" ? `Adjustment (${methodDesc})` : `Payment Received (${methodDesc})`,
-      debit: amt,
-      credit: 0,
-      type: "payment",
-      payment_method: p.payment_method || "-", // 👈 Add this line
-      bank_name: p.bank_name || null           // 👈 Add this line
+
+// 1. Same-day sequence priority (Oldest calculation order)
+    const getTypePriority = (type) => {
+      if (type === "snapshot" || type === "opening_balance") return 0;
+      if (type === "sale") return 1;
+      return 2;
+    };
+
+    // 2. Step 1: CHRONOLOGICAL SORT (Purani tareekh pehle taake running balance sahi calculate ho)
+    allEntries.sort((a, b) => {
+      const dateA = new Date(a.date).getTime();
+      const dateB = new Date(b.date).getTime();
+      
+      if (dateA !== dateB) return dateA - dateB;
+      
+      const prioA = getTypePriority(a.type);
+      const prioB = getTypePriority(b.type);
+      if (prioA !== prioB) return prioA - prioB;
+      
+      return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
     });
-  }
-});
 
-// 1. Array ko Chronological (Ascending) Order me calculate karein:
-allEntries.sort((a, b) => new Date(a.date) - new Date(b.date));
+    let runningBalance = hasSnapshot ? customerBaseline : 0;
+    let computedList = [];
 
-let runningBalance = hasSnapshot ? customerBaseline : 0;
-let computedList = [];
+    if (hasSnapshot) {
+      computedList.push({
+        id: "SNAPSHOT_OPENING",
+        date: snapshotDateTo,
+        description: `Opening Snapshot Balance (${snapshotDateTo})`,
+        debit: customerBaseline < 0 ? Math.abs(customerBaseline) : 0,
+        credit: customerBaseline >= 0 ? customerBaseline : 0,
+        type: "snapshot",
+        balance: runningBalance
+      });
+    }
 
-if (hasSnapshot) {
-  computedList.push({
-    id: "SNAPSHOT_OPENING",
-    date: snapshotDateTo,
-    description: `Opening Snapshot Balance (${snapshotDateTo})`,
-    debit: customerBaseline < 0 ? Math.abs(customerBaseline) : 0,
-    credit: customerBaseline >= 0 ? customerBaseline : 0,
-    type: "snapshot",
-    balance: runningBalance
-  });
-}
+    // Step 2: Calculate Exact Running Balance
+    allEntries.forEach((entry) => {
+      runningBalance = runningBalance + entry.credit - entry.debit;
 
-allEntries.forEach((entry) => {
-  runningBalance = runningBalance + entry.credit - entry.debit;
+      let matchDate = true;
+      if (startDate && new Date(entry.date) < new Date(startDate)) matchDate = false;
+      if (endDate && new Date(entry.date) > new Date(endDate)) matchDate = false;
 
-  let matchDate = true;
-  if (startDate && new Date(entry.date) < new Date(startDate)) matchDate = false;
-  if (endDate && new Date(entry.date) > new Date(endDate)) matchDate = false;
-
-  if (matchDate) {
-    computedList.push({
-      ...entry,
-      balance: runningBalance
+      if (matchDate) {
+        computedList.push({
+          ...entry,
+          balance: runningBalance
+        });
+      }
     });
-  }
-});
 
-// 2. Clear Sorting Rule for UI (Latest dates at top)
-// Target: Date DESC, ID DESC (for same day transactions)
-computedList.sort((a, b) => {
-  const dateDiff = new Date(b.date) - new Date(a.date);
-  if (dateDiff !== 0) return dateDiff;
-  return String(b.id).localeCompare(String(a.id));
-});
+    // Step 3: DISPLAY SORT (NEWEST FIRST AT TOP + SAME DAY REVERSE)
+    computedList.sort((a, b) => {
+      const dateA = new Date(a.date).getTime();
+      const dateB = new Date(b.date).getTime();
+      
+      // Target 1: Nayi Date Sab Se Upar
+      if (dateA !== dateB) return dateB - dateA; 
+      
+      // Snapshot hamesha sab se niche rahe Same-Day me
+      if (a.type === "snapshot") return 1;
+      if (b.type === "snapshot") return -1;
 
-res.json({
-  success: true,
-  customerName,
-  rows: computedList,
-  totalRemainingBalance: runningBalance
-});
+      // Target 2: Same-day me LATEST Entry Sab Se Upar (Payment/Sale Priority Reversed)
+      const prioA = getTypePriority(a.type);
+      const prioB = getTypePriority(b.type);
+      if (prioA !== prioB) return prioB - prioA;
 
+      return String(b.id).localeCompare(String(a.id), undefined, { numeric: true });
+    });
+
+    res.json({
+      success: true,
+      customerName,
+      rows: computedList,
+      totalRemainingBalance: runningBalance
+    });
+     
   } catch (err) {
     console.error(err);
     res.json({ success: false, error: err.message });
